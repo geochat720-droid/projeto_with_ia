@@ -1,0 +1,313 @@
+import { INestApplication } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import request from 'supertest';
+import { App } from 'supertest/types';
+import { DataSource } from 'typeorm';
+import { authRoutes } from './support/auth-routes';
+import { conversationRoutes } from './support/conversation-routes';
+import { PeopleService } from '../src/people/people.service';
+import { createTestApp } from './support/create-test-app';
+import { uniqueEmail } from './support/unique-email';
+
+type PeopleBody = { people: { id: string; name: string }[] };
+
+describe('busca de Pessoas', () => {
+  let app: INestApplication;
+  let server: App;
+
+  beforeAll(async () => {
+    app = await createTestApp();
+    server = app.getHttpServer() as App;
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  // Uma Membro com um Canal privado só dela, e um sufixo que separa os nomes deste teste.
+  async function privateChannel() {
+    const owner = await authRoutes.loggedIn(app);
+    const channelId = await conversationRoutes.privateChannelOf(
+      app,
+      owner.cookie,
+    );
+    return { owner, channelId, tag: randomUUID().slice(0, 8) };
+  }
+
+  function search(cookie: string, query: Record<string, string>) {
+    return request(server).get('/v1/people').query(query).set('Cookie', cookie);
+  }
+
+  const ids = (response: request.Response) =>
+    (response.body as PeopleBody).people.map((person) => person.id);
+
+  const names = (response: request.Response) =>
+    (response.body as PeopleBody).people.map((person) => person.name);
+
+  it('acha o nome sem diferenciar acentos e maiúsculas', async () => {
+    const { owner, channelId, tag } = await privateChannel();
+    await authRoutes.createPerson(app, { name: `Élida Rocha ${tag}` });
+    await authRoutes.createPerson(app, { name: `Elias Prado ${tag}` });
+
+    const [withoutAccent, withAccent] = await Promise.all([
+      search(owner.cookie, {
+        q: `ELIDA ROCHA ${tag}`,
+        not_member_of: channelId,
+      }),
+      search(owner.cookie, {
+        q: `élias prado ${tag}`,
+        not_member_of: channelId,
+      }),
+    ]);
+
+    expect(withoutAccent.status).toBe(200);
+    expect(names(withoutAccent)).toEqual([`Élida Rocha ${tag}`]);
+    expect(names(withAccent)).toEqual([`Elias Prado ${tag}`]);
+  });
+
+  it('não traz os bots', async () => {
+    const { cookie } = await authRoutes.loggedIn(app);
+    const tag = randomUUID().replaceAll('-', '').slice(0, 12);
+    const { person } = await authRoutes.createPerson(app, {
+      name: `Assistente ${tag}`,
+    });
+    await app
+      .get(DataSource)
+      .query('INSERT INTO bots (id, username, name) VALUES ($1, $2, $3)', [
+        randomUUID(),
+        `assistente-${tag}`,
+        `Assistente ${tag}`,
+      ]);
+
+    const response = await search(cookie, { q: tag });
+
+    expect(response.status).toBe(200);
+    expect(ids(response)).toEqual([person.id]);
+  });
+
+  it('trata %, _ e \\ como literais', async () => {
+    const { owner, channelId, tag } = await privateChannel();
+    await authRoutes.createPerson(app, { name: `Ana_100% ${tag}` });
+    await authRoutes.createPerson(app, { name: `Ana X100Y ${tag}` });
+    await authRoutes.createPerson(app, { name: `Barra \\ ${tag}` });
+
+    const [percent, backslash] = await Promise.all([
+      search(owner.cookie, { q: `_100%`, not_member_of: channelId }),
+      search(owner.cookie, { q: `\\ ${tag}`, not_member_of: channelId }),
+    ]);
+
+    expect(names(percent).filter((name) => name.endsWith(tag))).toEqual([
+      `Ana_100% ${tag}`,
+    ]);
+    expect(names(backslash)).toEqual([`Barra \\ ${tag}`]);
+  });
+
+  it('deixa de fora os Membros da Conversa', async () => {
+    const { owner, channelId, tag } = await privateChannel();
+    const member = await authRoutes.createPerson(app, {
+      name: `Membro ${tag}`,
+    });
+    await conversationRoutes.addMembers(app, owner.cookie, channelId, [
+      member.person.id,
+    ]);
+    await authRoutes.createPerson(app, { name: `Fora ${tag}` });
+
+    const response = await search(owner.cookie, {
+      q: tag,
+      not_member_of: channelId,
+    });
+
+    expect(names(response)).toEqual([`Fora ${tag}`]);
+  });
+
+  it('devolve até 20 em ordem alfabética, inclusive sem texto', async () => {
+    const { owner, channelId } = await privateChannel();
+
+    const response = await search(owner.cookie, { not_member_of: channelId });
+
+    expect(response.status).toBe(200);
+    const listed = names(response);
+    expect(listed).toHaveLength(20);
+    const collator = new Intl.Collator('pt-BR', { sensitivity: 'base' });
+    expect(
+      [...listed].sort(
+        (a, b) => collator.compare(a, b) || (a < b ? -1 : a > b ? 1 : 0),
+      ),
+    ).toEqual(listed);
+  });
+
+  it('responde 404 para quem não é Membro', async () => {
+    const { channelId } = await privateChannel();
+    const other = await authRoutes.loggedIn(app);
+
+    const response = await search(other.cookie, { not_member_of: channelId });
+
+    expect(response.status).toBe(404);
+    expect((response.body as { code: string }).code).toBe(
+      'conversation_not_found',
+    );
+  });
+
+  it('responde 400 com not_member_of malformado', async () => {
+    const { owner } = await privateChannel();
+
+    const response = await search(owner.cookie, { not_member_of: 'abc' });
+
+    expect(response.status).toBe(400);
+    expect((response.body as { code: string }).code).toBe('validation_failed');
+  });
+
+  describe('busca pelo @usuário (F05)', () => {
+    async function personWith(username: string, title?: string) {
+      return app.get(PeopleService).create({
+        email: uniqueEmail(),
+        name: `Pessoa ${username}`,
+        password: 'senha-de-teste',
+        username,
+        title,
+      });
+    }
+
+    it('acha pelo @usuário, com e sem o @', async () => {
+      const { cookie } = await authRoutes.loggedIn(app);
+      const username = `u${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+      const regina = await personWith(username);
+
+      const [withAt, withoutAt] = await Promise.all([
+        search(cookie, { q: `@${username}` }),
+        search(cookie, { q: username }),
+      ]);
+
+      for (const response of [withAt, withoutAt]) {
+        expect(response.status).toBe(200);
+        expect(ids(response)).toEqual([regina.id]);
+      }
+    });
+
+    it('sem not_member_of, inclui quem busca', async () => {
+      const username = `u${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+      const me = await personWith(username);
+      const cookie = authRoutes.sessionCookie(
+        await authRoutes.login(app, me.email, 'senha-de-teste'),
+      );
+
+      const response = await search(cookie, { q: username });
+
+      expect(ids(response)).toEqual([me.id]);
+    });
+
+    it('cada Pessoa traz o @usuário e o cargo', async () => {
+      const { cookie } = await authRoutes.loggedIn(app);
+      const username = `u${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+      const regina = await personWith(username, 'Engenheira de Software');
+
+      const response = await search(cookie, { q: username });
+
+      expect((response.body as { people: unknown[] }).people).toEqual([
+        {
+          id: regina.id,
+          name: `Pessoa ${username}`,
+          username,
+          title: 'Engenheira de Software',
+          status: null,
+          presence: 'away',
+        },
+      ]);
+    });
+  });
+  describe('member_of (lista de menções, F06)', () => {
+    it('traz só os Membros da Conversa', async () => {
+      const { owner, channelId, tag } = await privateChannel();
+      const { person: member } = await authRoutes.createPerson(app, {
+        name: `Mencionável ${tag}`,
+      });
+      await authRoutes.createPerson(app, { name: `Mencionável Fora ${tag}` });
+      await conversationRoutes
+        .addMembers(app, owner.cookie, channelId, [member.id])
+        .expect(200);
+
+      const response = await search(owner.cookie, {
+        q: `mencionável`,
+        member_of: channelId,
+      });
+
+      expect(response.status).toBe(200);
+      expect(ids(response)).toEqual([member.id]);
+    });
+
+    it('responde 404 para quem não é Membro da Conversa', async () => {
+      const { channelId } = await privateChannel();
+      const outsider = await authRoutes.loggedIn(app);
+
+      const response = await search(outsider.cookie, { member_of: channelId });
+
+      expect(response.status).toBe(404);
+    });
+
+    it('responde 400 com member_of malformado', async () => {
+      const { owner } = await privateChannel();
+
+      const response = await search(owner.cookie, { member_of: 'abc' });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('responde 400 com member_of e not_member_of juntos', async () => {
+      const { owner, channelId } = await privateChannel();
+
+      const response = await search(owner.cookie, {
+        member_of: channelId,
+        not_member_of: channelId,
+      });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe('admin=true', () => {
+    it('traz só os administradores que casam com q, em ordem de nome', async () => {
+      const { cookie } = await authRoutes.loggedIn(app);
+      const tag = randomUUID().replaceAll('-', '').slice(0, 12);
+      const people = app.get(PeopleService);
+      const bia = await authRoutes.createPerson(app, { name: `Bia ${tag}` });
+      const ana = await authRoutes.createPerson(app, { name: `Ana ${tag}` });
+      await authRoutes.createPerson(app, { name: `Caio ${tag}` });
+      await people.setAdmin(bia.person.id, true);
+      await people.setAdmin(ana.person.id, true);
+
+      const response = await search(cookie, { q: tag, admin: 'true' });
+
+      expect(response.status).toBe(200);
+      expect(ids(response)).toEqual([ana.person.id, bia.person.id]);
+      expect((response.body as PeopleBody).people[0]).toMatchObject({
+        name: `Ana ${tag}`,
+        username: ana.person.username,
+        presence: 'away',
+      });
+    });
+
+    it('sem q, traz administradores e ninguém que não administra', async () => {
+      const { cookie } = await authRoutes.loggedIn(app);
+      const admin = await authRoutes.createPerson(app, { name: 'Aaaa Admin' });
+      const other = await authRoutes.createPerson(app, { name: 'Aaaa Comum' });
+      await app.get(PeopleService).setAdmin(admin.person.id, true);
+
+      const response = await search(cookie, { admin: 'true' });
+
+      expect(response.status).toBe(200);
+      expect(ids(response).length).toBeLessThanOrEqual(20);
+      expect(ids(response)).not.toContain(other.person.id);
+      const found = await app.get(PeopleService).findByIds(ids(response));
+      expect(found.every((person) => person.isAdmin)).toBe(true);
+    });
+
+    it('responde 400 com admin fora de true', async () => {
+      const { cookie } = await authRoutes.loggedIn(app);
+
+      const response = await search(cookie, { admin: 'sim' });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toMatchObject({ code: 'validation_failed' });
+    });
+  });
+});

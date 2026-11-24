@@ -1,0 +1,77 @@
+// spec: e2e/plano-de-testes-f02.md
+// seed: e2e/seed.spec.ts
+import { expect, test } from "../fixtures";
+import { conversationIntro, messageList, readyHistory } from "../support/conversation-page";
+import { insertHistory } from "../support/database";
+
+test.describe("Histórico até a primeira Mensagem", () => {
+  test("carregar-anteriores-pelo-teclado", async ({
+    page,
+    person,
+    memberChannel: channel,
+    loggedInPage,
+  }) => {
+    void loggedInPage;
+    // Centenas de Shift+Tab pela lista: sozinho leva uns 15 s, e com a suíte em paralelo passa dos
+    // 30 s do padrão.
+    test.slow();
+    // Sem o IntersectionObserver, só o teclado pede as anteriores: focar o link o rolaria para a
+    // tela, e o sentinela carregaria sozinho.
+    await page.addInitScript(() => {
+      window.IntersectionObserver = class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+        takeRecords() {
+          return [];
+        }
+      } as unknown as typeof IntersectionObserver;
+    });
+    // 1. Abrir um Canal com duas páginas de histórico
+    await insertHistory(channel, person, 60);
+    await page.goto(`/conversas/${channel.id}`);
+    const historico = await readyHistory(page, channel.name);
+    const mensagens = messageList(page, channel.name);
+    const caixa = page.getByRole("textbox", { name: `Mensagem para #${channel.name}` });
+    await expect(caixa).toBeFocused();
+
+    // 2. A área de rolagem recebe o foco e rola pelas teclas. Entre a caixa e o botão ficam os
+    // controles de cada Mensagem: o nome da autora, que abre o Perfil (F05), e a barra de ações
+    // (F06). Toda parada no caminho é um controle de dentro da lista de Mensagens.
+    const botao = page.getByRole("button", { name: "Carregar mensagens anteriores" });
+    const focoNoBotao = () => botao.evaluate((element) => element === document.activeElement);
+    for (let paradas = 0; !(await focoNoBotao()); paradas += 1) {
+      expect(paradas).toBeLessThan(400);
+      await page.keyboard.press("Shift+Tab");
+      if (await focoNoBotao()) break;
+      expect(
+        await mensagens.evaluate((lista) => lista.contains(document.activeElement)),
+      ).toBe(true);
+    }
+    await expect(botao).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(historico).toBeFocused();
+    await page.keyboard.press("End");
+    // A rolagem pelo teclado é suave: espera chegar ao fim antes de medir.
+    const fim = await historico.evaluate(
+      (element) => element.scrollHeight - element.clientHeight,
+    );
+    await expect
+      .poll(() => historico.evaluate((element) => element.scrollTop))
+      .toBeGreaterThanOrEqual(fim - 1);
+    await page.keyboard.press("PageUp");
+    await expect.poll(() => historico.evaluate((element) => element.scrollTop)).toBeLessThan(fim);
+
+    // 3. Tab até "Carregar mensagens anteriores" e Enter
+    await page.keyboard.press("Tab");
+    await expect(botao).toBeFocused();
+    await page.keyboard.press("Enter");
+
+    await expect(mensagens.getByRole("listitem")).toHaveCount(60);
+    // O botão sai com a última página, e o foco vai para a área do histórico.
+    await expect(historico).toBeFocused();
+    await expect(
+      conversationIntro(page, channel.name),
+    ).toBeVisible();
+  });
+});
